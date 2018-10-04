@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"io/ioutil"
 	"log"
@@ -9,22 +11,26 @@ import (
 	"net/url"
 	"time"
 
+	gorilla "github.com/gorilla/mux"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/jws"
-	// calendar "google.golang.org/api/calendar/v3"
+	calendar "google.golang.org/api/calendar/v3"
 )
 
 var (
-	oauthClient  googleClient
-	sessionStore = map[string]authorizedClient{}
+	oauthClient      googleClient
+	sessionStore     = map[string]authorizedClient{}
+	sessionCalendars = map[string][]calendar.CalendarListEntry{}
 )
 
 const (
 	serverSecret       = "aRandomishStringForHashing"
 	sessionTokenName   = "session_token"
 	loginRoute         = "/login"
+	logoutRoute        = "/logout"
 	homeRoute          = "/home"
-	eventsRoute        = "/events"
+	calendarsRoute     = "/calendars"
+	calendarRoute      = "/calandars/{calendarID}"
 	oauthCallbackRoute = "/oauth2Callback"
 )
 
@@ -81,8 +87,10 @@ func exchangeForToken(authCode string) (client authorizedClient, err error) {
 	return client, err
 }
 
+// Base64 encoded sessionID
 func sessionToken(clientID, subscriber, secret string) string {
-	return string(sha256.New().Sum([]byte(clientID + subscriber + secret)))
+	sum := sha256.New().Sum([]byte(clientID + subscriber + secret))
+	return base64.StdEncoding.EncodeToString(sum)
 }
 
 func setSession(apiClient authorizedClient, w http.ResponseWriter, r *http.Request) {
@@ -124,9 +132,21 @@ func oauthHandler(w http.ResponseWriter, r *http.Request) {
 }
 func isAuthorized(r *http.Request) (sessionID string, ok bool) {
 	c, err := r.Cookie(sessionTokenName)
+	if err != nil {
+		return
+	}
+	log.Println("Checking cookie")
 	if err == nil {
 		sessionID = c.Value
 		ok = true
+	}
+	if session, sessionOK := sessionStore[sessionID]; !sessionOK {
+		ok = false
+	} else {
+		log.Printf("Found session %#v", session)
+		if !session.Valid() {
+			ok = false
+		}
 	}
 	return
 }
@@ -136,40 +156,82 @@ func redirectTo(w http.ResponseWriter, r *http.Request, path string) {
 }
 
 func homeHandler(w http.ResponseWriter, r *http.Request) {
-	_, authorized := isAuthorized(r)
-	if !authorized {
-		redirectTo(w, r, loginRoute)
-		return
-	}
 	w.Write([]byte("Welcome home!"))
 }
 
-func eventsHandler(w http.ResponseWriter, r *http.Request) {
-	sessionID, authorized := isAuthorized(r)
-	if !authorized {
-		redirectTo(w, r, loginRoute)
+func serverError(w http.ResponseWriter, err error) {
+	log.Println("ServerError:", err)
+	w.WriteHeader(http.StatusInternalServerError)
+}
+
+// GET /calandars
+func calendarsListHandler(w http.ResponseWriter, r *http.Request) {
+	sessionID, _ := isAuthorized(r)
+	session := sessionStore[sessionID]
+	log.Println(calendarsRoute, "Restored session", sessionID)
+	// Get events
+	ctx := context.Background()
+	client := oauth2.NewClient(ctx, oauth2.StaticTokenSource(&session.Token))
+	service, err := calendar.New(client)
+	if err != nil {
+		serverError(w, err)
 		return
 	}
-	session := sessionStore[sessionID]
-	_ = session
-	// Get events
-	// ctx := context.Background()
-	// oauth2Client := oauth2.NewClient(ctx, session)
-	// service, err := calendar.New()
+	calendarList, err := service.CalendarList.List().Do()
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	for _, entry := range calendarList.Items {
+		// Local/resident datastore
+		sessionCalendars[sessionID] = append(sessionCalendars[sessionID], *entry)
+	}
+	usersCalendars, _ := json.Marshal(sessionCalendars[sessionID])
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(usersCalendars)
+
+}
+func calendarListEntryHandler(w http.ResponseWriter, r *http.Request) {
+
 }
 func loginHandler(w http.ResponseWriter, r *http.Request) {
-	_, authorized := isAuthorized(r)
-	if authorized {
-		redirectTo(w, r, homeRoute)
-	}
 	index, _ := ioutil.ReadFile("public/index.html")
 	_, _ = w.Write(index)
 }
+func logoutHandler(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:    sessionTokenName,
+		Expires: time.Unix(0, 0),
+	})
+	redirectTo(w, r, loginRoute)
+}
+func logMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("%s %s", r.Method, r.URL.Path)
+		next.ServeHTTP(w, r)
+	})
+}
 
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	})
+}
+
+// TODO: Not fully generalized. Only handls the calendarsRoute
 func main() {
-	http.HandleFunc(oauthCallbackRoute, oauthHandler)
-	http.HandleFunc(homeRoute, homeHandler)
-	http.HandleFunc(eventsRoute, eventsHandler)
-	http.HandleFunc(loginRoute, loginHandler)
+	r := gorilla.NewRouter()
+	r.HandleFunc(calendarsRoute, calendarsListHandler)
+	r.HandleFunc(calendarRoute, calendarListEntryHandler)
+	r.HandleFunc(oauthCallbackRoute, oauthHandler)
+	r.HandleFunc(homeRoute, homeHandler)
+	r.HandleFunc(calendarsRoute, calendarsListHandler)
+	r.HandleFunc(loginRoute, loginHandler)
+	r.HandleFunc(logoutRoute, logoutHandler)
+	r.HandleFunc("/", homeHandler)
+
+	r.Use(logMiddleware)
+	r.Use(corsMiddleware)
+
+	http.Handle("/", r)
 	http.ListenAndServe(":8080", nil)
 }
