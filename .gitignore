@@ -13,3 +13,4 @@
 
 # Ignore node integration examples
 node/
+secret.json
