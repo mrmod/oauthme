@@ -29,9 +29,11 @@ const (
 	loginRoute         = "/login"
 	logoutRoute        = "/logout"
 	homeRoute          = "/home"
+	rootRoute          = "/"
 	calendarsRoute     = "/calendars"
-	calendarRoute      = "/calandars/{calendarID}"
+	calendarRoute      = "/calendars/{calendarID}"
 	oauthCallbackRoute = "/oauth2Callback"
+	timeFormat         = "2006-01-02T15:04:05Z"
 )
 
 type token int
@@ -108,7 +110,7 @@ func setSession(apiClient authorizedClient, w http.ResponseWriter, r *http.Reque
 	})
 	sessionStore[sessionID] = apiClient
 	// Redirect to the authorized portion of the site
-	http.Redirect(w, r, "/home", http.StatusTemporaryRedirect)
+	redirectTo(w, r, rootRoute)
 }
 
 // Handle the OAuth callback triggered by a Login request
@@ -152,10 +154,16 @@ func isAuthorized(r *http.Request) (sessionID string, ok bool) {
 }
 
 func redirectTo(w http.ResponseWriter, r *http.Request, path string) {
+	setCORSHeaders(w)
 	http.Redirect(w, r, path, http.StatusTemporaryRedirect)
 }
 
 func homeHandler(w http.ResponseWriter, r *http.Request) {
+	if _, ok := isAuthorized(r); !ok {
+		log.Println("Redirecting unauthorized session to login")
+		redirectTo(w, r, "/login")
+		return
+	}
 	w.Write([]byte("Welcome home!"))
 }
 
@@ -166,7 +174,11 @@ func serverError(w http.ResponseWriter, err error) {
 
 // GET /calandars
 func calendarsListHandler(w http.ResponseWriter, r *http.Request) {
-	sessionID, _ := isAuthorized(r)
+	sessionID, authorized := isAuthorized(r)
+	if !authorized {
+		redirectTo(w, r, loginRoute)
+		return
+	}
 	session := sessionStore[sessionID]
 	log.Println(calendarsRoute, "Restored session", sessionID)
 	// Get events
@@ -186,13 +198,39 @@ func calendarsListHandler(w http.ResponseWriter, r *http.Request) {
 		// Local/resident datastore
 		sessionCalendars[sessionID] = append(sessionCalendars[sessionID], *entry)
 	}
+	// TODO: Can marshall directly
 	usersCalendars, _ := json.Marshal(sessionCalendars[sessionID])
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(usersCalendars)
 
 }
 func calendarListEntryHandler(w http.ResponseWriter, r *http.Request) {
-
+	sessionID, authorized := isAuthorized(r)
+	if !authorized {
+		redirectTo(w, r, loginRoute)
+		return
+	}
+	session := sessionStore[sessionID]
+	ctx := context.Background()
+	client := oauth2.NewClient(ctx, oauth2.StaticTokenSource(&session.Token))
+	service, err := calendar.New(client)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	calendarID := gorilla.Vars(r)["calendarID"]
+	log.Printf("Finding events for %s", calendarID)
+	timeMax := time.Now().Add(time.Hour * 24).Format(timeFormat)
+	timeMin := time.Now().Format(timeFormat)
+	events, err := service.Events.List(calendarID).TimeMax(timeMax).TimeMin(timeMin).Do()
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	setContentTypeJSON(w)
+	setCORSHeaders(w)
+	eventsJSON, _ := events.MarshalJSON()
+	w.Write(eventsJSON)
 }
 func loginHandler(w http.ResponseWriter, r *http.Request) {
 	index, _ := ioutil.ReadFile("public/index.html")
@@ -211,20 +249,33 @@ func logMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
-
+func setCORSHeaders(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+	w.Header().Set("Access-Control-Max-Age", "3600")
+}
+func setContentTypeJSON(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+}
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setCORSHeaders(w)
+		next.ServeHTTP(w, r)
 	})
 }
 
 // TODO: Not fully generalized. Only handls the calendarsRoute
 func main() {
 	r := gorilla.NewRouter()
+	// Calendars
 	r.HandleFunc(calendarsRoute, calendarsListHandler)
-	r.HandleFunc(calendarRoute, calendarListEntryHandler)
+	calendarsRouter := r.PathPrefix(calendarsRoute).Subrouter()
+	calendarsRouter.HandleFunc("/", calendarsListHandler)
+	calendarsRouter.HandleFunc("/{calendarID}", calendarListEntryHandler)
+
 	r.HandleFunc(oauthCallbackRoute, oauthHandler)
 	r.HandleFunc(homeRoute, homeHandler)
-	r.HandleFunc(calendarsRoute, calendarsListHandler)
 	r.HandleFunc(loginRoute, loginHandler)
 	r.HandleFunc(logoutRoute, logoutHandler)
 	r.HandleFunc("/", homeHandler)
