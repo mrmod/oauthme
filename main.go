@@ -15,6 +15,7 @@ import (
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/jws"
 	calendar "google.golang.org/api/calendar/v3"
+	"google.golang.org/api/googleapi"
 )
 
 var (
@@ -132,36 +133,11 @@ func oauthHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusForbidden)
 }
-func isAuthorized(r *http.Request) (sessionID string, ok bool) {
-	c, err := r.Cookie(sessionTokenName)
-	if err != nil {
-		return
-	}
-	log.Println("Checking cookie")
-	if err == nil {
-		sessionID = c.Value
-		ok = true
-	}
-	if session, sessionOK := sessionStore[sessionID]; !sessionOK {
-		ok = false
-	} else {
-		log.Printf("Found session %#v", session)
-		if !session.Valid() {
-			ok = false
-		}
-	}
-	return
-}
-
-func redirectTo(w http.ResponseWriter, r *http.Request, path string) {
-	setCORSHeaders(w)
-	http.Redirect(w, r, path, http.StatusTemporaryRedirect)
-}
 
 func homeHandler(w http.ResponseWriter, r *http.Request) {
 	if _, ok := isAuthorized(r); !ok {
 		log.Println("Redirecting unauthorized session to login")
-		redirectTo(w, r, "/login")
+		redirectTo(w, r, loginRoute)
 		return
 	}
 	w.Write([]byte("Welcome home!"))
@@ -224,9 +200,16 @@ func calendarListEntryHandler(w http.ResponseWriter, r *http.Request) {
 	timeMin := time.Now().Format(timeFormat)
 	events, err := service.Events.List(calendarID).TimeMax(timeMax).TimeMin(timeMin).Do()
 	if err != nil {
-		serverError(w, err)
-		return
+		switch t := err.(type) {
+		case *googleapi.Error:
+			w.WriteHeader(t.Code)
+			return
+		default:
+			serverError(w, err)
+			return
+		}
 	}
+
 	setContentTypeJSON(w)
 	setCORSHeaders(w)
 	eventsJSON, _ := events.MarshalJSON()
@@ -234,6 +217,7 @@ func calendarListEntryHandler(w http.ResponseWriter, r *http.Request) {
 }
 func loginHandler(w http.ResponseWriter, r *http.Request) {
 	index, _ := ioutil.ReadFile("public/index.html")
+	setCORSHeaders(w)
 	_, _ = w.Write(index)
 }
 func logoutHandler(w http.ResponseWriter, r *http.Request) {
@@ -248,6 +232,29 @@ func logMiddleware(next http.Handler) http.Handler {
 		log.Printf("%s %s", r.Method, r.URL.Path)
 		next.ServeHTTP(w, r)
 	})
+}
+func isAuthorized(r *http.Request) (sessionID string, ok bool) {
+	c, err := r.Cookie(sessionTokenName)
+	if err != nil {
+		return
+	}
+	if err == nil {
+		sessionID = c.Value
+		ok = true
+	}
+	if session, sessionOK := sessionStore[sessionID]; !sessionOK {
+		ok = false
+	} else {
+		if !session.Valid() {
+			ok = false
+		}
+	}
+	return
+}
+
+func redirectTo(w http.ResponseWriter, r *http.Request, path string) {
+	// setCORSHeaders(w)
+	http.Redirect(w, r, path, http.StatusTemporaryRedirect)
 }
 func setCORSHeaders(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
